@@ -1,0 +1,99 @@
+# Central configuration. Every value can be overridden with an ECOM_* environment
+# variable (see src/ecom/config.py) or a CLI flag, so CI, Docker and local runs share one file.
+seed: 42
+
+paths:
+  raw: data/raw              # <raw>/<source>/*.csv  (source = synthetic | kaggle)
+  bronze: data/bronze        # typed Parquet, partitioned by event_date
+  silver: data/silver        # cleaned events + sessions
+  gold: data/gold            # user features, labels, scores
+  outputs: data/outputs      # small CSV/JSON results consumed by the dashboard and reports
+  warehouse: data/warehouse  # Spark SQL / Hive warehouse
+  metastore: data/metastore  # embedded Derby Hive metastore
+  reports: reports
+  figures: reports/figures
+  models: models
+  tools: .tools              # portable JDK / winutils downloaded by `ecom setup`
+
+data:
+  source: synthetic          # synthetic (no download needed) | kaggle (real 14 GB dataset)
+  sample_rate: 0.05          # user-level sample used by the dev workflow; 1.0 = full data
+  kaggle_dataset: mkechinov/ecommerce-behavior-data-from-multi-category-store
+  kaggle_files: ["2019-Oct.csv", "2019-Nov.csv"]
+
+synthetic:
+  n_users: 1000000           # "full" synthetic population; the 5% sample keeps ~50k users
+  n_products: 30000
+  start_date: "2019-10-01"
+  end_date: "2019-11-30"     # inclusive
+  sale_days: ["2019-11-15", "2019-11-16", "2019-11-17"]
+  duplicate_rate: 0.002      # injected exact duplicates so data quality checks have something to find
+  zero_price_rate: 0.0005
+  missing_session_rate: 0.0001
+
+spark:
+  master: "local[*]"
+  driver_memory: 6g
+  shuffle_partitions: 16
+  hive: true                 # enableHiveSupport() with an embedded Derby metastore
+
+labels:
+  feature_days: 21           # behaviour window before the cutoff
+  label_days: 7              # purchase window after the cutoff
+  # cutoff = first day of the label window; features use [cutoff - 21d, cutoff)
+  splits:
+    train: "2019-10-22"      # features Oct 01-21, label Oct 22-28
+    valid: "2019-11-08"      # features Oct 18-Nov 07, label Nov 08-14
+    test: "2019-11-24"       # features Nov 03-23, label Nov 24-30
+  scoring_cutoff: "2019-12-01"  # "today": features Nov 10-30, scored for serving
+
+ml:
+  top_categories: 12         # one-hot encode the user's top category among the N most common
+  optuna_trials: 30
+  optuna_timeout_s: 600
+  h2o_max_runtime_s: 300     # plan: 1200 on full data; override with ECOM_H2O_MAX_RUNTIME_S
+  h2o_max_mem: 4G
+  spark_gbt_max_iter: 40
+  xgb_device: cpu            # cpu | cuda | auto (cuda when a GPU and a CUDA build are present)
+  registered_model: ecom-propensity
+
+experiment:
+  salt: "promo-2019-11"
+  alpha: 0.05
+  power: 0.8
+  mde_relative: 0.10         # minimum detectable relative lift in conversion
+  treatment_share: 0.5
+  discount: 0.10             # 10% off for targeted users
+  base_uplift: 0.25          # relative lift in purchase odds for a maximally price-sensitive user
+  target_top_deciles: 1      # users in the top N propensity deciles get the coupon in treatment
+  max_aov_drop: 0.10         # guardrail: buyer AOV may not drop by more than 10% (significantly)
+  n_aa_simulations: 500      # A/A simulations for the peeking demo
+
+mongo:
+  uri: mongodb://localhost:27017
+  db: ecom
+  collection: users
+
+mlflow:
+  tracking_uri: sqlite:///mlflow.db
+  experiment: ecom-propensity
+
+api:
+  url: http://localhost:8000
+
+# `ecom kaggle push|status|logs|pull`: run the pipeline on the real dataset in a private
+# Kaggle kernel (see src/ecom/kaggle_job.py). Kernel id = <your Kaggle username>/<kernel_slug>.
+kaggle:
+  kernel_slug: ecom-kaggle-run
+  accelerator: NvidiaTeslaT4   # GPU T4 x2 (4 CPUs, 31 GB RAM)
+  samples: [0.05, 1.0]         # run in order in one session; bronze Parquet is built once
+  skip_steps: [load-mongo]     # no MongoDB server on Kaggle
+  eval_local_champion: true    # also score this machine's registered champion on the real data
+  env:                         # ECOM__* overrides applied to the remote run only
+    ECOM__SPARK__DRIVER_MEMORY: 12g
+    ECOM__SPARK__SHUFFLE_PARTITIONS: 64
+    ECOM__ML__XGB_DEVICE: auto
+    ECOM__ML__OPTUNA_TRIALS: 60
+    ECOM__ML__OPTUNA_TIMEOUT_S: 1800
+    ECOM__ML__H2O_MAX_MEM: 8G
+    ECOM__ML__H2O_MAX_RUNTIME_S: 1200
