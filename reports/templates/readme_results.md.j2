@@ -1,0 +1,16 @@
+{% set ov = overview %}
+_Last run: {{ generated_at }} · source **{{ source }}** · user sample **{{ sample_rate | pct(0) }}**{% if synthetic %} (simulated data, see note above){% endif %}_
+
+| Area | Result |
+|---|---|
+| Scale | {{ ov.events | num }} events, {{ ov.users | num }} users, {{ ov.sessions | num }} sessions analysed{% if benchmark %}; full bronze table {{ benchmark.rows | num }} rows{% endif %} |
+| Funnel | {% for f in funnel %}{{ f.stage }} {{ f.users | num }}{% if not loop.last %} -> {% endif %}{% endfor %} users; session conversion {{ ov.session_conversion | pct(2) }} |
+| Stats | {{ tests | selectattr("significant") | list | length }} of {{ tests | length }} hypothesis tests significant after Benjamini-Hochberg |
+| Best model | {{ best_model.model }}: test PR-AUC {{ best_model.test_pr_auc | num(3) }} (base rate {{ best_model.test_base_rate | num(3) }}), ROC-AUC {{ best_model.test_roc_auc | num(3) }}, top-decile lift {{ best_model.test_top_decile_lift | num(1) }}x |
+{% if ab %}
+| A/B test | conversion {{ ab.conversion.details.p_a | pct(2) }} -> {{ ab.conversion.details.p_b | pct(2) }} ({{ ab.conversion.details.relative_lift | spct }}, p = {{ ab.conversion.p_value | pval }}), SRM p = {{ ab.srm.p_value | pval }}, CUPED variance -{{ ab.revenue.cuped_stats.variance_reduction | pct(0) }} |
+| Decision | **{{ ab.decision.verdict }}** |
+{% endif %}
+{% if benchmark %}
+| Benchmark | {% for name, r in benchmark.results.items() %}{{ name }} {{ r.seconds_median | num(1) }} s{% if not loop.last %} · {% endif %}{% endfor %} |
+{% endif %}

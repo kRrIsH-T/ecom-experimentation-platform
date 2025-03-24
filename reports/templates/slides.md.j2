@@ -1,0 +1,121 @@
+---
+marp: true
+theme: default
+paginate: true
+title: E-commerce Experimentation & Propensity Platform
+---
+{% set ov = overview %}
+{% set facts = eda.facts %}
+
+# E-commerce Experimentation & Propensity Platform
+
+Spark/Hive pipeline · SQL analytics · inferential stats · propensity ML · A/B testing · MongoDB + FastAPI · Streamlit
+
+{% if synthetic %}_Data: simulated Kaggle-format clickstream (Oct-Nov 2019)_{% endif %}
+
+---
+
+## Problem
+
+- Which customers will buy in the next 7 days?
+- Does a targeted coupon make them buy more - without losing revenue?
+- {{ ov.events | num }} events, {{ ov.users | num }} users, {{ ov.sessions | num }} sessions ({{ sample_rate | pct(0) }} user sample)
+
+---
+
+## Architecture
+
+```
+CSV -> Spark -> bronze Parquet (Hive) -> silver sessions -> gold features/labels
+     -> SQL analytics | stats | ML (sklearn, XGBoost, Spark MLlib, H2O) -> MLflow
+     -> scores -> MongoDB -> FastAPI -> Streamlit
+```
+
+One command: `ecom all` · tests + lint in CI
+
+---
+
+## Data quality
+
+- {{ dq.rows | num }} raw rows; {{ dq.duplicate_rows | num }} duplicates and {{ dq.zero_prices | num }} zero prices removed
+- `category_code` missing on {{ dq.null_rate.category_code | pct(0) }} of rows (kept as `unknown`)
+- Whole-user sampling keeps histories intact
+
+---
+
+## Funnel and behaviour
+
+![w:1000](figures/eda_funnel.png)
+
+- {{ facts.view_to_cart_users | pct(0) }} of viewers cart; {{ facts.cart_to_purchase_users | pct(0) }} of carters buy
+- Top 1% of users = {{ facts.top_1pct_revenue_share | pct(0) }} of revenue
+
+---
+
+## Time patterns and sale
+
+![w:1000](figures/eda_daily.png)
+
+Sale: {{ facts.sale_traffic_multiplier | num(1) }}x traffic, conversion {{ facts.non_sale_conversion | pct(1) }} -> {{ facts.sale_conversion | pct(1) }}
+
+---
+
+## Statistical tests (BH-corrected)
+
+| Question | Effect | p (BH) |
+|---|---|---|
+{% for t in tests %}
+| {{ t.name }} | {{ t.effect_size_name }} {{ t.effect_size | num(3) }} | {{ t.p_adjusted | pval }} |
+{% endfor %}
+
+---
+
+## Propensity model
+
+| Model | Test PR-AUC | Top-decile lift |
+|---|---|---|
+{% for m in models %}
+| {{ m.model }}{% if m.champion %} ★{% endif %} | {{ m.test_pr_auc | num(3) }} | {{ m.test_top_decile_lift | num(1) }}x |
+{% endfor %}
+
+Base rate {{ best_model.test_base_rate | pct(1) }} · time-based split, leakage-tested
+
+---
+
+## Why customers buy (SHAP)
+
+![w:700](figures/shap_summary.png)
+
+---
+{% if ab %}
+
+## A/B test design
+
+- Coupon {{ ab.effect_model.discount | pct(0) }} to top-decile propensity users, hashed 50/50 split
+- Primary: 7-day conversion · guardrails: revenue/user, AOV
+- Needs {{ ab.design.n_per_arm | num }} users/arm for a {{ ab.design.mde_relative | pct(0) }} MDE (alpha 0.05, power 80%)
+
+---
+
+## A/B test results
+
+![w:1050](figures/experiment_summary.png)
+
+---
+
+## Decision: {{ ab.decision.verdict }}
+
+{% for r in ab.decision.reasons %}
+- {{ r }}
+{% endfor %}
+
+CUPED cut revenue variance by {{ ab.revenue.cuped_stats.variance_reduction | pct(0) }} · peeking inflates false positives to {{ ab.peeking.fpr_any_look | pct(0) }}
+
+---
+{% endif %}
+
+## Takeaways and next steps
+
+- Prioritise outreach by propensity; fix the view-to-cart leak
+- Run every campaign as a pre-registered, fixed-horizon test
+- Next: uplift modelling (target persuadable users), real Kaggle data run, shared Hive metastore

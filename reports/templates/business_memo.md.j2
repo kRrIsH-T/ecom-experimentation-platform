@@ -1,0 +1,69 @@
+{% set ov = overview %}
+{% set facts = eda.facts %}
+# Memo: Who will buy next week, and should we send them a coupon?
+
+**To:** E-commerce leadership  **From:** Analytics  **Date:** {{ generated_at[:10] }}
+
+{% if synthetic %}
+_Note: these figures come from a realistic simulated version of the store's Oct-Nov 2019
+clickstream, used while access to the real data is pending. The method carries over unchanged._
+
+{% endif %}
+## Recommendation
+
+{% if ab %}
+{% if ab.decision.verdict == "SHIP" %}
+**Roll out the targeted {{ ab.effect_model.discount | pct(0) }} coupon** to the customers our
+model ranks in the top {{ ab.effect_model.top_deciles * 10 }}% most likely to buy. In a controlled
+test it raised the share of customers who bought within a week from
+{{ ab.conversion.details.p_a | pct(1) }} to {{ ab.conversion.details.p_b | pct(1) }}
+({{ ab.conversion.details.relative_lift | spct(0) }}) without a meaningful loss of revenue per customer.
+{% else %}
+**Do not roll out the coupon yet.** In a controlled test, sending a
+{{ ab.effect_model.discount | pct(0) }} coupon to the customers most likely to buy moved the share
+who purchased within a week from {{ ab.conversion.details.p_a | pct(1) }} to
+{{ ab.conversion.details.p_b | pct(1) }}{% if not ab.decision.primary_win %}, a change too small to
+tell apart from chance{% else %}, but it cost more in discounts than it earned{% endif %}.
+{% if ab.design.power_at_available_n < 0.8 %}
+The test was also smaller than needed: to reliably detect a {{ ab.design.mde_relative | pct(0) }}
+improvement we need about {{ ab.design.n_per_arm | num }} customers per group
+({% if ab.design.duration_days %}roughly {{ ab.design.duration_days }} days of traffic{% else %}more traffic{% endif %}).
+{% endif %}
+Keep using the model to prioritise outreach, and re-run the test at full size.
+{% endif %}
+{% endif %}
+
+## What we found
+
+1. **A few customers carry the business.** The top 1% of visitors produce
+   {{ facts.top_1pct_revenue_share | pct(0) }} of revenue, and only {{ facts.buyer_share | pct(0) }}
+   of visitors buy anything in two months.
+2. **The biggest leak is before the cart.** {{ facts.view_to_cart_users | pct(0) }} of visitors
+   ever add something to their cart; once they do, {{ facts.cart_to_purchase_users | pct(0) }} buy.
+   Improving product pages and prices matters more than the checkout.
+3. **Promotions work on traffic.** The mid-November sale brought
+   {{ facts.sale_traffic_multiplier | num(1) }}x the usual daily visitors and lifted conversion from
+   {{ facts.non_sale_conversion | pct(1) }} to {{ facts.sale_conversion | pct(1) }}.
+4. **Weekends convert better** and cheaper products sell more readily; both are statistically
+   solid, not noise.
+5. **{{ facts.top_category | title }} is the core:** {{ facts.top_category_revenue_share | pct(0) }} of revenue.
+
+## The prediction model, in plain terms
+
+Every week the model gives each recently active customer a probability of buying in the next
+seven days. If we contact the top 10% it flags, we reach
+{{ best_model.test_top_decile_recall | pct(0) }} of next week's buyers - about
+{{ best_model.test_top_decile_lift | num(1) }} times better than picking customers at random.
+The strongest signals are recent activity (visits and product views in the last week), how long
+ago the customer last visited, and whether past carts turned into orders.
+
+## What it would take to act
+
+- Score customers weekly (automated; results are available per customer through an internal
+  service and a dashboard).
+- Run any coupon or campaign as a proper A/B test, fixed in size and length in advance.
+  Checking results every day and stopping early would make roughly
+  {% if ab %}{{ ab.peeking.fpr_any_look | pct(0) }}{% else %}one in five{% endif %} of "wins" false alarms.
+- Next step: target customers whose behaviour a coupon actually *changes* (an "uplift" model),
+  not just those already likely to buy, so discounts are not given to people who would have
+  bought anyway.

@@ -1,0 +1,302 @@
+{% set ov = overview %}
+{% set facts = eda.facts %}
+# E-commerce Experimentation & Propensity Platform - Technical Report
+
+_Generated {{ generated_at }} by `ecom report` from the outputs of the last pipeline run
+(source: **{{ source }}**, user sample: **{{ sample_rate | pct(0) }}**). Every number below is
+filled in from `data/outputs/`, so re-running the pipeline on other data rewrites this report._
+
+{% if synthetic %}
+> **Data note.** This run uses the project's synthetic generator, which reproduces the schema,
+> format and broad behaviour of the Kaggle "eCommerce behavior data from multi category store"
+> dataset (Oct-Nov 2019) because the real 14 GB files need a Kaggle account. The methods are
+> identical for the real data (`ecom download && ecom --source kaggle all`); the numbers are
+> not real-world findings.
+{% endif %}
+
+## 1. Summary
+
+| | |
+|---|---|
+| Events analysed | {{ ov.events | num }} ({{ ov.users | num }} users, {{ ov.sessions | num }} sessions, {{ ov.first_date }} to {{ ov.last_date }}) |
+| Revenue | {{ ov.revenue | num }} from {{ ov.purchases | num }} purchases by {{ ov.buyers | num }} buyers |
+| Session conversion | {{ ov.session_conversion | pct(2) }} (user conversion {{ ov.user_conversion | pct(1) }}) |
+| Best propensity model | {{ best_model.model }}: test PR-AUC {{ best_model.test_pr_auc | num(3) }} vs base rate {{ best_model.test_base_rate | num(3) }}, top-decile lift {{ best_model.test_top_decile_lift | num(1) }}x |
+{% if ab %}
+| Experiment | conversion {{ ab.conversion.details.p_a | pct(2) }} -> {{ ab.conversion.details.p_b | pct(2) }} ({{ ab.conversion.details.relative_lift | spct }}, p = {{ ab.conversion.p_value | pval }}); CUPED cut revenue variance by {{ ab.revenue.cuped_stats.variance_reduction | pct(0) }} |
+| Decision | **{{ ab.decision.verdict }}** |
+{% endif %}
+
+## 2. Data and pipeline
+
+**Architecture.** Raw Kaggle-format CSVs are converted by Spark into typed Parquet
+(**bronze**, partitioned by `event_date`), cleaned and sessionised (**silver**), and turned into
+point-in-time user features, labels and scores (**gold**). Every table is registered as an
+external table in the Hive metastore (`ecom.*`, embedded Derby metastore), so all SQL runs
+against `ecom.events_clean`, `ecom.sessions`, `ecom.user_features` and friends. Small result
+sets are exported for the dashboard; MongoDB serves per-user profiles to a FastAPI service;
+MLflow tracks every model run and holds the registered champion.
+
+```
+CSV --Spark--> bronze (Parquet/Hive) --> silver: events_clean, sessions
+                                     --> gold: user_features x4 snapshots, labels, model_dataset
+                                     --> SQL (funnel, cohorts, RFM, categories, KPIs) --> CSV
+gold --> stats (scipy/statsmodels) | models (sklearn, XGBoost, Spark MLlib, H2O) --> MLflow
+champion --> scores --> MongoDB --> FastAPI  --> Streamlit dashboard
+```
+
+**Development workflow.** Everything is built on a deterministic **user-level** sample
+(`xxhash64(user_id, seed) mod 10000 < rate x 10000`): sampling whole users keeps each user's
+history intact, so per-user features and labels are unbiased. This run used
+{{ sample_rate | pct(0) }} of users.
+
+**Data quality** (full bronze table, {{ dq.rows | num }} rows; details in
+[data_quality.md](data_quality.md)):
+
+- {{ dq.duplicate_rows | num }} exact duplicate rows ({{ dq.duplicate_rate | pct(2) }}) and
+  {{ dq.zero_prices | num }} zero / {{ dq.negative_prices | num }} negative prices, dropped in silver;
+- `category_code` missing on {{ dq.null_rate.category_code | pct(1) }} and `brand` on
+  {{ dq.null_rate.brand | pct(1) }} of rows (kept as `unknown`, as in the real dataset);
+- `user_session` missing on {{ dq.null_rate.user_session | pct(3) }} of rows (dropped: cannot be sessionised).
+
+{% if benchmark %}
+**Scale benchmark** - the same aggregation (events, purchases, revenue and distinct users per
+day x category) over all {{ benchmark.rows | num }} bronze rows on a {{ benchmark.machine.cpus }}-core,
+{{ benchmark.machine.ram_gb | num }} GB laptop (median of timed runs after a warm-up; memory is the
+peak extra RSS of the process tree, including the Spark JVM):
+
+| Engine | Time (s) | Peak extra memory (MB) |
+|---|---:|---:|
+{% for name, r in benchmark.results.items() %}
+| {{ name }} | {{ r.seconds_median | num(2) }} | {{ r.peak_extra_rss_mb | num }} |
+{% endfor %}
+
+pandas must materialise every column in memory before grouping, so its footprint grows with
+the data; DuckDB and Spark stream column chunks. On one machine DuckDB is fastest; Spark pays
+JVM and scheduling overhead locally but is the only option that scales out to a cluster when
+the data no longer fits one machine (the real dataset is ~110M events per month).
+{% endif %}
+
+## 3. Descriptive analytics
+
+![Funnel](figures/eda_funnel.png)
+
+{% for f in funnel %}
+{% if not loop.first %}
+- {{ f.stage }}: {{ f.users | num }} users ({{ f.pct_of_viewers | pct(1) }} of viewers, step conversion {{ f.step_conversion | pct(1) }})
+{% endif %}
+{% endfor %}
+
+**Insights**
+
+{% for i in eda.insights %}
+{{ loop.index }}. {{ i }}
+{% endfor %}
+
+![Daily traffic and conversion](figures/eda_daily.png)
+![Day x hour patterns](figures/eda_hour_dow.png)
+![Cohort retention](figures/eda_cohorts.png)
+![Brand Pareto](figures/eda_pareto.png)
+![Distributions](figures/eda_distributions.png)
+
+**RFM segments** (NTILE quintiles over buyers, `src/ecom/sql/rfm.sql`):
+
+| Segment | Users | Share of buyers | Revenue share | Avg recency (days) | Avg orders |
+|---|---:|---:|---:|---:|---:|
+{% for r in rfm %}
+| {{ r.segment }} | {{ r.users | num }} | {{ r.user_share | pct(1) }} | {{ r.revenue_share | pct(1) }} | {{ r.avg_recency_days | num(1) }} | {{ r.avg_frequency | num(2) }} |
+{% endfor %}
+
+## 4. Inferential statistics
+
+Each test states its hypotheses, checks its assumptions, and reports an effect size with a
+confidence interval. The family of primary tests is corrected with Benjamini-Hochberg (FDR 5%).
+
+| Question | Test | Effect | 95% CI | p | p (BH) |
+|---|---|---|---|---:|---:|
+{% for t in tests %}
+| {{ t.name }} | {{ t.test }} | {{ t.effect_size_name }} = {{ t.effect_size | num(3) }} | {% if t.ci_of %}{{ t.ci_low | num(3) }} to {{ t.ci_high | num(3) }} ({{ t.ci_of }}){% else %}-{% endif %} | {{ t.p_value | pval }} | {{ t.p_adjusted | pval }} |
+{% endfor %}
+
+Interpretation:
+
+{% for t in tests %}
+- **{{ t.name }}.** H0: {{ t.h0 }}. {% if t.significant %}Rejected after BH correction{% else %}Not rejected{% endif %} ({{ t.effect_size_name }} {{ t.effect_size | num(3) }}).
+{% if t.name.startswith("Session conversion: weekend") %}
+  Weekend sessions convert at {{ t.details.p_b | pct(2) }} vs {{ t.details.p_a | pct(2) }} on weekdays
+  ({{ t.details.relative_lift | spct }} relative). Caveat: sessions of one user are correlated, so the
+  z-test's independence assumption holds only approximately.
+{% elif t.name.startswith("Order value") %}
+  ANOVA assumptions failed (Shapiro-Wilk / Levene), so the rank-based Kruskal-Wallis test was used;
+  Dunn post-hoc pairs (BH-adjusted) are in `stats_tests.json`. Medians:
+  {% for k, v in t.details.group_medians.items() %}{{ k }} {{ v | num }}{% if not loop.last %}, {% endif %}{% endfor %}.
+{% elif t.name.startswith("Session duration") %}
+  Buyers' sessions are longer (median {{ t.details.median_b | num }} s vs {{ t.details.median_a | num }} s);
+  durations are heavily skewed, hence the Mann-Whitney U test rather than a t-test.
+{% elif t.name.startswith("Product price") %}
+  Across {{ t.details.n_products | num }} products, pricier items convert less often (a monotonic,
+  not necessarily linear, relationship - hence Spearman).
+{% endif %}
+{% endfor %}
+
+**Bootstrap (BCa) 95% CIs for the median order value:**
+{% for b in bootstrap %}{{ b.segment }} {{ b.median | num(1) }} [{{ b.ci_low | num(1) }}, {{ b.ci_high | num(1) }}]{% if not loop.last %}; {% endif %}{% endfor %}.
+
+## 5. Propensity model
+
+**Task.** Predict whether a user purchases in the next {{ cfg.labels.label_days }} days from
+their behaviour in the previous {{ cfg.labels.feature_days }} days. Snapshots are time-based to
+avoid leakage: train cutoff {{ cfg.labels.splits.train }}, validation {{ cfg.labels.splits.valid }},
+test {{ cfg.labels.splits.test }}. Features only see events strictly before the cutoff and labels
+only the window after it; `tests/test_labels.py` asserts that features computed on the full
+history equal those computed on history truncated at the cutoff.
+
+| Split | Users | Positive rate |
+|---|---:|---:|
+{% for s in ["train", "valid", "test"] %}
+| {{ s }} | {{ dataset[s].users | num }} | {{ dataset[s].positive_rate | pct(2) }} |
+{% endfor %}
+
+**Features (29 numeric + top category):** RFM (recency, frequency, monetary, AOV), funnel ratios
+(view-to-cart, cart-to-purchase, cart abandonment), breadth (distinct categories, brands,
+products), price level and price sensitivity (carted vs viewed price), timing (weekend and
+evening share, session length), and last-7-day activity and trend.
+
+| Model | Valid PR-AUC | Test PR-AUC | Test ROC-AUC | Brier | Top-decile precision | Top-decile lift | Train time (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+{% for m in models %}
+| {{ m.model }}{% if m.champion %} **(champion)**{% endif %} | {{ m.valid_pr_auc | num(3) }} | {{ m.test_pr_auc | num(3) }} | {{ m.test_roc_auc | num(3) }} | {{ m.test_brier | num(4) }} | {{ m.test_top_decile_precision | pct(1) }} | {{ m.test_top_decile_lift | num(2) }}x | {{ m.train_seconds | num(1) }} |
+{% endfor %}
+
+PR-AUC is the primary metric because only {{ best_model.test_base_rate | pct(1) }} of users buy
+in a given week (a random model scores PR-AUC = base rate). The champion is selected on
+**validation** PR-AUC among the servable sklearn-compatible models, then evaluated once on test.
+Scores are Platt-calibrated on the validation snapshot, so they can be read as probabilities.
+H2O AutoML ({% if h2o %}{{ h2o | length }} best of its leaderboard shown in `h2o_leaderboard.csv`{% else %}skipped{% endif %})
+and Spark MLlib GBT (distributed, trained inside Spark on the Hive table) are benchmarks.
+{% if best_model.key == "logreg" %}
+The regularised logistic regression matches or beats the tree ensembles here: the behavioural
+signal is mostly monotonic and additive in log-scaled counts, which a linear model captures with
+less variance. That is a useful finding, not a failure - the simpler model is easier to explain
+and to serve.
+{% endif %}
+
+![Model curves](figures/model_curves.png)
+![Lift and gains](figures/model_gains.png)
+
+**What drives the prediction (SHAP on the XGBoost model):**
+
+{% for d in drivers %}
+{{ loop.index }}. {{ d.text }}
+{% endfor %}
+
+![SHAP summary](figures/shap_summary.png)
+
+{% if ab %}
+{% set d = ab.design %}
+## 6. A/B experiment
+
+### Design document
+
+- **Hypothesis.** Sending a {{ ab.effect_model.discount | pct(0) }} coupon to the users in the top
+  {{ ab.effect_model.top_deciles }} propensity decile(s) increases next-7-day conversion.
+- **Unit and assignment.** User; deterministic SHA-256 hash of `salt:user_id`, 50/50 split
+  (`src/ecom/experiment/simulate_ab.py`). The salt was chosen **before launch** by a seedfinder
+  search over candidate salts, using only assignment counts and pre-period covariates
+  (balance criteria: SRM p >= {{ d.salt_search.criteria.min_srm_p }}, |standardized mean
+  difference| <= {{ d.salt_search.criteria.max_abs_smd }} on pre-spend, propensity and sessions):
+  `{{ d.salt }}` after {{ d.salt_search.candidates_tried }} candidate(s).
+- **Population.** Users active in the 21 days before {{ cfg.labels.splits.test }} (held-out test
+  snapshot; no model has seen their outcomes): {{ d.population | num }} users.
+- **Primary metric.** Conversion (share of users who purchase within 7 days), analysed
+  intention-to-treat over the whole arm.
+- **Guardrails.** Revenue per user (must not drop significantly) and buyer average order value
+  (must not drop by more than {{ cfg.experiment.max_aov_drop | pct(0) }}).
+- **Error rates.** alpha = {{ d.alpha }}, power = {{ d.power | pct(0) }}, minimum detectable
+  effect = {{ d.mde_relative | pct(0) }} relative on a baseline of {{ d.baseline_rate | pct(2) }}.
+- **Sample size** (`statsmodels` `NormalIndPower`, Cohen's h = {{ d.effect_size_h | num(4) }}):
+  **{{ d.n_per_arm | num }} users per arm**{% if d.duration_days %}, i.e. about
+  **{{ d.duration_days }} days** at {{ d.daily_eligible_users | num }} eligible users per day{% endif %}.
+  This run has {{ d.n_per_arm_available | num }} per arm, so its MDE is
+  {{ d.mde_at_available_n | pct(1) }} (power {{ d.power_at_available_n | pct(0) }} for a
+  {{ d.mde_relative | pct(0) }} lift){% if d.power_at_available_n < 0.8 %} - underpowered for the
+  design MDE, which the decision has to respect{% endif %}.
+
+**Simulation assumptions** (the effect is simulated; outcomes in control are observed data):
+the coupon multiplies a targeted user's purchase odds by `1 + {{ ab.effect_model.base_uplift }} x s`,
+where `s` is the user's price-sensitivity percentile and the baseline probability is the
+calibrated model score; newly converted users spend their average viewed price minus the
+discount; users who would have bought anyway still redeem it (the cost the guardrails watch).
+
+### Results
+
+| Check / metric | Control | Treatment | Difference (95% CI) | p |
+|---|---:|---:|---|---:|
+| SRM (users per arm) | {{ ab.srm.details.observed[0] | num }} | {{ ab.srm.details.observed[1] | num }} | expected 50/50 | {{ ab.srm.p_value | pval }} |
+| Conversion (primary) | {{ ab.conversion.details.p_a | pct(2) }} | {{ ab.conversion.details.p_b | pct(2) }} | {{ ab.conversion.details.diff | pct(2) }} ({{ ab.conversion.ci_low | pct(2) }} to {{ ab.conversion.ci_high | pct(2) }}); relative {{ ab.conversion.details.relative_lift | spct }} | {{ ab.conversion.p_value | pval }} |
+| Conversion, CUPAC (score covariate) | | | {{ ab.conversion_cupac.test.details.diff | pct(2) }} ({{ ab.conversion_cupac.test.ci_low | pct(2) }} to {{ ab.conversion_cupac.test.ci_high | pct(2) }}) | {{ ab.conversion_cupac.test.p_value | pval }} |
+| Revenue / user, raw (Welch) | {{ ab.revenue.raw.details.mean_a | num(2) }} | {{ ab.revenue.raw.details.mean_b | num(2) }} | {{ ab.revenue.raw.details.diff | num(2) }} ({{ ab.revenue.raw.ci_low | num(2) }} to {{ ab.revenue.raw.ci_high | num(2) }}) | {{ ab.revenue.raw.p_value | pval }} |
+| Revenue / user, CUPED | | | {{ ab.revenue.cuped.details.diff | num(2) }} ({{ ab.revenue.cuped.ci_low | num(2) }} to {{ ab.revenue.cuped.ci_high | num(2) }}) | {{ ab.revenue.cuped.p_value | pval }} |
+| Buyer AOV (guardrail) | {{ ab.aov_guardrail.details.mean_a | num(1) }} | {{ ab.aov_guardrail.details.mean_b | num(1) }} | {{ ab.aov_guardrail.details.relative_lift | spct }} | {{ ab.aov_guardrail.p_value | pval }} |
+
+**CUPED.** Using pre-period spend as covariate (theta = {{ ab.revenue.cuped_stats.theta | num(3) }},
+correlation {{ ab.revenue.cuped_stats.correlation | num(2) }}) reduced the variance of revenue per user
+by {{ ab.revenue.cuped_stats.variance_reduction | pct(0) }} and the CI width by
+{{ ab.revenue.ci_width_reduction | pct(0) }}, without changing the expected effect. The same idea
+with the model score as covariate (CUPAC) reduced conversion variance by
+{{ ab.conversion_cupac.cuped_stats.variance_reduction | pct(0) }}.
+
+**Segments** (BH-adjusted):
+
+| Segment | Control | Treatment | Relative lift | p (BH) |
+|---|---:|---:|---:|---:|
+{% for s in ab.segments %}
+| {{ s.segment }} | {{ s.conv_control | pct(2) }} | {{ s.conv_treatment | pct(2) }} | {{ s.relative_lift | spct }} | {{ s.p_bh | pval }} |
+{% endfor %}
+
+**Bayesian view** (Beta(1,1) priors): P(treatment > control) = {{ ab.bayesian.prob_treatment_better | pct(1) }},
+relative lift {{ ab.bayesian.lift_mean | spct }} (95% credible interval
+{{ ab.bayesian.lift_credible_95[0] | spct }} to {{ ab.bayesian.lift_credible_95[1] | spct }}),
+expected loss of shipping {{ ab.bayesian.expected_loss_ship | pct(3) }} conversion points.
+
+**Peeking pitfall.** In {{ ab.peeking.n_simulations }} A/A tests on the untreated outcomes,
+checking the p-value after each of the {{ ab.peeking.looks }} days and stopping at the first
+p < 0.05 produced a false-positive rate of **{{ ab.peeking.fpr_any_look | pct(1) }}** instead of
+{{ ab.peeking.fpr_final_look_only | pct(1) }} for a single look at the planned end. Keeping the
+family-wise rate at 5% with daily looks needs a per-look threshold of about
+{{ ab.peeking.empirical_pocock_threshold | num(4) }} (an empirical Pocock boundary) - or simply a
+fixed horizon.
+
+![Experiment summary](figures/experiment_summary.png)
+
+### Decision: {{ ab.decision.verdict }}
+
+{% for r in ab.decision.reasons %}
+- {{ r }}
+{% endfor %}
+{% endif %}
+
+## 7. Limitations and next steps
+
+{% if synthetic %}
+- The data is synthetic; effect sizes and model scores describe the generator, not real shoppers.
+  Run on the Kaggle data for real findings.
+{% endif %}
+- The treatment effect is simulated from stated assumptions; a real test is the only way to
+  measure it, and the propensity model targets *likely buyers*, who are not necessarily the users
+  a coupon *changes* - an uplift model (T-learner) would target persuadable users instead.
+- Session-level tests treat sessions as independent; a user-clustered analysis would be stricter.
+- The Hive metastore is embedded Derby (single process); a shared Postgres-backed metastore is
+  the production setup.
+
+## 8. Reproduce
+
+```bash
+uv venv --python 3.11 .venv && uv pip install -e ".[dev]"
+ecom setup              # JDK 17 (+winutils on Windows) and MongoDB into .tools/
+ecom mongo start
+ecom {% if not synthetic %}--source {{ source }} {% endif %}--sample {{ sample_rate }} all
+```
+{% if timings %}
+Step timings on this data (seconds, {{ hardware }}): {% for k, v in timings.items() %}{{ k }} {{ v }}{% if not loop.last %}, {% endif %}{% endfor %}.
+{% endif %}
