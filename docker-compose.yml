@@ -1,0 +1,76 @@
+# Optional containerised route (the native route needs no Docker: `ecom setup && ecom all`).
+#   docker compose up -d mongo
+#   docker compose run --rm pipeline            # ecom all on the 5% sample
+#   docker compose up -d api dashboard mlflow   # http://localhost:8000/docs, :8501, :5000
+#   docker compose --profile hadoop up -d       # optional HDFS namenode + datanode
+# The repo is mounted at /app, so data/, mlflow.db and mlruns/ are shared with the host.
+x-app: &app
+  build: .
+  image: ecom-experimentation:latest
+  volumes:
+    - ./:/app
+  environment:
+    ECOM__MONGO__URI: mongodb://mongo:27017
+    ECOM__SPARK__DRIVER_MEMORY: 4g
+  depends_on:
+    mongo:
+      condition: service_healthy
+
+services:
+  mongo:
+    image: mongo:7
+    ports: ["27017:27017"]
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  pipeline:
+    <<: *app
+    command: ["ecom", "--sample", "0.05", "all"]
+    profiles: ["pipeline"]
+
+  api:
+    <<: *app
+    command: ["ecom", "serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["8000:8000"]
+
+  dashboard:
+    <<: *app
+    command: ["ecom", "dashboard", "--port", "8501"]
+    environment:
+      ECOM__MONGO__URI: mongodb://mongo:27017
+      ECOM__API__URL: http://api:8000
+    ports: ["8501:8501"]
+
+  mlflow:
+    <<: *app
+    command: ["mlflow", "ui", "--backend-store-uri", "sqlite:////app/mlflow.db",
+              "--host", "0.0.0.0", "--port", "5000"]
+    ports: ["5000:5000"]
+    depends_on: []
+
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    profiles: ["hadoop"]
+    environment:
+      CLUSTER_NAME: ecom
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+    ports: ["9870:9870", "9000:9000"]
+    volumes: [hdfs-name:/hadoop/dfs/name]
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    profiles: ["hadoop"]
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:9000
+      SERVICE_PRECONDITION: namenode:9870
+    volumes: [hdfs-data:/hadoop/dfs/data]
+    depends_on: [namenode]
+
+volumes:
+  mongo-data:
+  hdfs-name:
+  hdfs-data:
